@@ -1,162 +1,223 @@
 import os
 import time
-import hashlib
 import json
+import hashlib
+
 import redis
-from fastapi import FastAPI, Request, HTTPException, status
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, Field
 from Bio.Seq import Seq
 
-app = FastAPI(title="SeqLab API", description="DNA & Protein Sequence Analysis with Caching & Rate Limiting")
+app = FastAPI(
+    title="SeqLab API",
+    description="DNA & Protein Sequence Analysis with Caching & Rate Limiting",
+)
 
+# ------------------------------------------------------------------ Redis setup
+# Deployed (Render / Upstash): set REDIS_URL.
+# Local / docker-compose: REDIS_HOST (defaults to localhost) is used instead.
+REDIS_URL = os.getenv("REDIS_URL")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 
 try:
-    redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0, decode_responses=True)
+    if REDIS_URL:
+        redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+    else:
+        redis_client = redis.Redis(
+            host=REDIS_HOST,
+            port=6379,
+            db=0,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
     redis_client.ping()
     REDIS_AVAILABLE = True
 except Exception:
+    redis_client = None
     REDIS_AVAILABLE = False
 
-MAX_TOKENS = 5
-REFILL_RATE = 1.0
+# ----------------------------------------------------------------------- Config
+MAX_TOKENS = 5            # bucket capacity = max burst per client
+REFILL_RATE = 1.0         # tokens added per second (sustained rate)
+CACHE_TTL_SECONDS = 60
+VALID_CHARS = set("ATGCUN")
+
 
 class SequenceRequest(BaseModel):
     sequence: str = Field(..., description="DNA sequence string")
 
+
+# ---------------------------------------------------------------------- Helpers
 def validate_sequence(seq_str: str):
     if not seq_str:
         raise HTTPException(status_code=400, detail="Sequence cannot be empty.")
-    valid_chars = set("ATGCUN")
-    if not all(c in valid_chars for c in seq_str):
-        raise HTTPException(status_code=400, detail=f"Invalid character found in sequence. Allowed: A, T, G, C, U, N.")
+    if not all(c in VALID_CHARS for c in seq_str):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid character found in sequence. Allowed: A, T, G, C, U, N.",
+        )
+
+
+def get_client_ip(request: Request) -> str:
+    # Behind a proxy (Render) the real client IP is in X-Forwarded-For.
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 
 def check_rate_limit(client_id: str) -> bool:
+    """Token bucket stored in a Redis hash. Fails open if Redis is unavailable."""
     if not REDIS_AVAILABLE:
         return True
-    redis_key = f"rate_limit:{client_id}"
-    now = time.time()
-    bucket = redis_client.hgetall(redis_key)
-    if not bucket:
-        tokens = MAX_TOKENS - 1
-        last_refill = now
-    else:
-        tokens = float(bucket["tokens"])
-        last_refill = float(bucket["last_refill"])
-        elapsed = now - last_refill
-        tokens = min(MAX_TOKENS, tokens + (elapsed * REFILL_RATE))
-        if tokens < 1:
-            return False
-        tokens -= 1
-        last_refill = now
-    redis_client.hset(redis_key, mapping={"tokens": tokens, "last_refill": last_refill})
-    redis_client.expire(redis_key, 3600)
-    return True
+    try:
+        key = f"rate_limit:{client_id}"
+        now = time.time()
+        bucket = redis_client.hgetall(key)
+        if not bucket:
+            tokens = MAX_TOKENS - 1
+        else:
+            elapsed = now - float(bucket["last_refill"])
+            tokens = min(MAX_TOKENS, float(bucket["tokens"]) + elapsed * REFILL_RATE)
+            if tokens < 1:
+                return False
+            tokens -= 1
+        redis_client.hset(key, mapping={"tokens": tokens, "last_refill": now})
+        redis_client.expire(key, 3600)
+        return True
+    except redis.RedisError:
+        return True
+
+
+def enforce_rate_limit(request: Request):
+    if not check_rate_limit(get_client_ip(request)):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded.",
+            headers={"Retry-After": "1"},  # one token refills per second
+        )
+
 
 def get_cache_key(operation: str, sequence: str) -> str:
     return hashlib.sha256(f"{operation}:{sequence.strip().upper()}".encode()).hexdigest()
 
-def enforce_rate_limit(request: Request):
-    client_ip = request.client.host if request.client else "unknown"
-    if not check_rate_limit(client_ip):
-          raise HTTPException(status_code=429, detail="Rate limit exceeded.",
-                      headers={"Retry-After": "5"})   # use your real refill time
-      
 
-def validate_sequence(seq_str: str):
-    if not seq_str:
-        raise HTTPException(status_code=400, detail="Sequence cannot be empty.")
-    # Check for invalid non-nucleotide characters
-    valid_chars = set("ATGCUN")
-    if not all(c in valid_chars for c in seq_str):
-        raise HTTPException(status_code=400, detail=f"Invalid character found in sequence. Allowed: A, T, G, C, U, N.")
+def cache_get(key: str):
+    """Single Redis GET (no exists()+get() race). Returns None on miss or Redis error."""
+    if not REDIS_AVAILABLE:
+        return None
+    try:
+        raw = redis_client.get(key)
+        return json.loads(raw) if raw else None
+    except (redis.RedisError, ValueError):
+        return None
+
+
+def cache_set(key: str, value: dict):
+    if not REDIS_AVAILABLE:
+        return
+    try:
+        redis_client.setex(key, CACHE_TTL_SECONDS, json.dumps(value))
+    except redis.RedisError:
+        pass
+
+
+def run_cached(operation: str, request: Request, body: SequenceRequest, compute):
+    """Shared flow: rate limit -> validate -> cache lookup -> compute -> cache store."""
+    enforce_rate_limit(request)
+    start = time.perf_counter()
+
+    seq_str = body.sequence.strip().upper()
+    validate_sequence(seq_str)
+
+    key = get_cache_key(operation, seq_str)
+    hit = cache_get(key)
+    if hit is not None:
+        return {
+            "cached": True,
+            "response_time_ms": round((time.perf_counter() - start) * 1000, 2),
+            **hit,
+        }
+
+    try:
+        result = compute(seq_str)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    cache_set(key, result)
+    return {
+        "cached": False,
+        "response_time_ms": round((time.perf_counter() - start) * 1000, 2),
+        **result,
+    }
+
+
+# ------------------------------------------------------------ Analysis functions
+def trim_to_codons(seq):
+    return seq[: len(seq) - len(seq) % 3]
+
+
+def compute_gc(seq_str: str) -> dict:
+    seq = Seq(seq_str)
+    gc = (seq.count("G") + seq.count("C")) / len(seq) * 100
+    return {"sequence": seq_str, "length": len(seq), "gc_content_percent": round(gc, 2)}
+
+
+def compute_reverse_complement(seq_str: str) -> dict:
+    return {"original": seq_str, "reverse_complement": str(Seq(seq_str).reverse_complement())}
+
+
+def compute_translation(seq_str: str) -> dict:
+    return {"sequence": seq_str, "protein": str(trim_to_codons(Seq(seq_str)).translate())}
+
+
+def compute_orfs(seq_str: str) -> dict:
+    seq = Seq(seq_str)
+    orfs = []
+    for frame in range(3):
+        translated = str(trim_to_codons(seq[frame:]).translate())
+        for p in translated.split("*"):
+            start = p.find("M")
+            if start != -1:
+                orfs.append(
+                    {"frame": frame + 1, "protein_length": len(p) - start, "protein": p[start:]}
+                )
+    return {"sequence": seq_str, "orfs_found": len(orfs), "orfs": orfs}
+
+
+# ----------------------------------------------------------------------- Routes
+RESPONSES = {
+    400: {"description": "Empty or invalid sequence"},
+    429: {"description": "Rate limit exceeded"},
+}
+
 
 @app.get("/")
 def home():
     return {"message": "Welcome to SeqLab!", "redis_connected": REDIS_AVAILABLE}
 
-@app.post("/gc-content")
+
+@app.post("/gc-content", responses=RESPONSES)
 def calculate_gc(request: Request, body: SequenceRequest):
-    enforce_rate_limit(request)
-    start_time = time.time()
-    seq_str = body.sequence.strip().upper()
-    validate_sequence(seq_str)
-    
-    cache_key = get_cache_key("gc-content", seq_str)
-    if REDIS_AVAILABLE and redis_client.exists(cache_key):
-        return {"cached": True, "response_time_ms": round((time.time() - start_time) * 1000, 2), **json.loads(redis_client.get(cache_key))}
-    
-    try:
-        seq = Seq(seq_str)
-        result = {"sequence": seq_str, "length": len(seq), "gc_content_percent": round(((seq.count("G") + seq.count("C")) / len(seq)) * 100, 2)}
-        if REDIS_AVAILABLE:
-            redis_client.setex(cache_key, 60, json.dumps(result))
-        return {"cached": False, "response_time_ms": round((time.time() - start_time) * 1000, 2), **result}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return run_cached("gc-content", request, body, compute_gc)
 
-@app.post("/reverse-complement")
+
+@app.post("/reverse-complement", responses=RESPONSES)
 def reverse_complement(request: Request, body: SequenceRequest):
-    enforce_rate_limit(request)
-    start_time = time.time()
-    seq_str = body.sequence.strip().upper()
-    validate_sequence(seq_str)
-    
-    cache_key = get_cache_key("reverse-complement", seq_str)
-    if REDIS_AVAILABLE and redis_client.exists(cache_key):
-        return {"cached": True, "response_time_ms": round((time.time() - start_time) * 1000, 2), **json.loads(redis_client.get(cache_key))}
-    
-    try:
-        seq = Seq(seq_str)
-        result = {"original": seq_str, "reverse_complement": str(seq.reverse_complement())}
-        if REDIS_AVAILABLE:
-            redis_client.setex(cache_key, 60, json.dumps(result))
-        return {"cached": False, "response_time_ms": round((time.time() - start_time) * 1000, 2), **result}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return run_cached("reverse-complement", request, body, compute_reverse_complement)
 
-@app.post("/translate")
+
+@app.post("/translate", responses=RESPONSES)
 def translate_sequence(request: Request, body: SequenceRequest):
-    enforce_rate_limit(request)
-    start_time = time.time()
-    seq_str = body.sequence.strip().upper()
-    validate_sequence(seq_str)
-    
-    cache_key = get_cache_key("translate", seq_str)
-    if REDIS_AVAILABLE and redis_client.exists(cache_key):
-        return {"cached": True, "response_time_ms": round((time.time() - start_time) * 1000, 2), **json.loads(redis_client.get(cache_key))}
-    
-    try:
-        seq = Seq(seq_str)
-        result = {"sequence": seq_str, "protein": str(seq.translate())}
-        if REDIS_AVAILABLE:
-            redis_client.setex(cache_key, 60, json.dumps(result))
-        return {"cached": False, "response_time_ms": round((time.time() - start_time) * 1000, 2), **result}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return run_cached("translate", request, body, compute_translation)
 
-@app.post("/orfs")
+
+@app.post("/orfs", responses=RESPONSES)
 def find_orfs(request: Request, body: SequenceRequest):
-    enforce_rate_limit(request)
-    start_time = time.time()
-    seq_str = body.sequence.strip().upper()
-    validate_sequence(seq_str)
-    
-    cache_key = get_cache_key("orfs", seq_str)
-    if REDIS_AVAILABLE and redis_client.exists(cache_key):
-        return {"cached": True, "response_time_ms": round((time.time() - start_time) * 1000, 2), **json.loads(redis_client.get(cache_key))}
-    
-    try:
-        seq = Seq(seq_str)
-        orfs = []
-        for frame in range(3):
-            translated = seq[frame:].translate(to_stop=False)
-            for p in str(translated).split("*"):
-                if "M" in p:
-                    orfs.append({"frame": frame + 1, "protein_length": len(p[p.find("M"):]), "protein": p[p.find("M"):]})
-        result = {"sequence": seq_str, "orfs_found": len(orfs), "orfs": orfs}
-        if REDIS_AVAILABLE:
-            redis_client.setex(cache_key, 60, json.dumps(result))
-        return {"cached": False, "response_time_ms": round((time.time() - start_time) * 1000, 2), **result}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return run_cached("orfs", request, body, compute_orfs)
