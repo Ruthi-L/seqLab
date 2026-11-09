@@ -2,7 +2,7 @@
 
 A fast, rate-limited REST API for DNA sequence analysis, built with **FastAPI**, **Biopython** and **Redis**.
 
-**Live demo:** [https://YOUR-APP.onrender.com/docs](https://seqlab.onrender.com/docs) &nbsp;|&nbsp; **Stack:** Python · FastAPI · Biopython · Redis · Docker
+**Live demo:**(https://seqlab.onrender.com/docs) &nbsp;|&nbsp; **Stack:** Python · FastAPI · Biopython · Redis · Docker
 
 > `/docs` is an interactive Swagger UI: try every endpoint in the browser, no setup needed. The demo runs on a free tier, so the first request after inactivity can take 30-60 seconds to wake up.
 
